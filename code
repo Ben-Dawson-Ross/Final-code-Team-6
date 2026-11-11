@@ -1,0 +1,791 @@
+/* 
+ROCKET FLIGHT DATA LOGGER  
+ Hardware:
+ ESP32-C6-Zero (Microcontroller)
+ MPU6050 Accelerometer + Gyroscope (I2C, Address 0x68) 
+ BMP388 Barometer (Pressure + Temp) (I2C, Address 0x76)
+ SD card module                      (SPI)
+*/
+
+
+// Libaries 
+#include <Wire.h>              // lets the ESP32 talk over I2C (the MPU6050 and BMP388 both use it)
+#include <SPI.h>               // lets the ESP32 talk over SPI (for the SD card)
+#include <SD.h>                // makes and writes the files on the SD card
+#include <Adafruit_Sensor.h>   // shared data types that the Adafruit sensor libraries need
+#include <Adafruit_MPU6050.h>  // library for the MPU6050 accelerometer/gyro
+#include <Adafruit_BMP3XX.h>   // library for the BMP388 barometer
+#include <math.h>              // Allows for Maths functions: sqrt(), pow(), fabs()
+
+// Pins and Addresses (Same as old data logger)
+#define SDA_PIN 22   // I2C data wire
+#define SCL_PIN 21   // I2C clock wire (IO21 on the schematic, IO20 is the MPU6050 INT pin)
+
+// SD card pins (SPI)
+#define SD_MOSI 1    // data going out from the ESP32 to the SD card
+#define SD_MISO 3    // data coming back from the SD card to the ESP32
+#define SD_SCK  2    // SPI clock
+#define SD_CS   0    // Chip Select ()
+
+// Voltage sensing pins (ADC 1 and ADC 2 on the schematic)
+#define BATTERY_ADC_PIN   5   // ADC 1: battery voltage through R2/R3 after the D2 diode
+#define REGULATOR_ADC_PIN 4   // ADC 2: 5V from the TPS61023 boost regulator through R6/R7
+
+// I2C addresses, each sensor has its own address so they can share the same 2 wires
+#define MPU6050_ADDRESS 0x68
+#define BMP388_ADDRESS  0x76
+
+
+// Configuration Parameters 
+
+//-----Timing------
+const unsigned long SAMPLE_INTERVAL_MS = 100;             // 100ms between samples (10 samples per second)
+
+//----- Calibratiion-----
+const int SENSOR_WARMUP_SAMPLES    = 10;                  // readings removed at start-up while sensors settle (1 s)
+const int CALIBRATION_SAMPLES      = 50;                  // readings averaged for calibration (50 x 100ms = 5 s)
+
+//-----Pre-launch rolling buffer-----
+const int PRELAUNCH_BUFFER_SAMPLES = 20;                  // keeps the last 20 samples (2 s) from before launch
+
+//-----Launch detection (PAD -> BOOST)-----
+// it counts as a launch when EITHER test A or test B is true for 
+// LAUNCH_CONFIRM_SAMPLES samples in a row,
+const float LAUNCH_ACCEL_THRESHOLD_G  = 1.5;              // Test A: if Total accell is 1.5 g above resting (2.5g) recognises as launch
+const float LAUNCH_VELOCITY_THRESHOLD = 10.0;             // Test B: if climbing is greater than 10m/s
+const float LAUNCH_ALTITUDE_THRESHOLD = 5.0;              //        .... And higher than 5 meters above the pad
+const int   LAUNCH_CONFIRM_SAMPLES    = 2;                // Has to have 2 samples so that an accidental bump cant trigger data logging
+
+//-----Burnout (Boost -> Coast) ----
+const float BURNOUT_ACCEL_THRESHOLD_G = 0.5;              // motor is finished when total accel falls below 1.5 g
+const int BURNOUT_CONFIRM_SAMPLES     = 2;                // for 2 samples in a row 
+
+//-----Apogee (Coast -> Descent)-----
+const float APOGEE_DROP_M          = 2.0;                 // must have fallen at least 2m below the highest point (m)...
+const int   APOGEE_CONFIRM_SAMPLES = 3;                   // ...and be going down for 3 samples in a row (0.3 s)
+
+//-----Landing (Descent -> Landed)-----
+const float LANDING_VELOCITY_THRESHOLD = 1.0;             // going up or down slower than 1 m/s
+const float LANDING_ACCEL_TOLERANCE_G  = 0.2;             // and accel is within 0.2 g of what it read sitting still
+const unsigned long LANDING_CONFIRM_MS = 3000;            // has to stay like that for 3 s to count as landed
+const unsigned long MAX_FLIGHT_TIME_MS = 300000;          // backup: stops logging 5 min after launch even if landing is never detected
+
+//-----Smoothing (0 to 1), smaller = smoother but slower to react-----
+const float ALTITUDE_SMOOTHING = 0.5;                     // 50 % of the new data comes from the last data
+const float VELOCITY_SMOOTHING = 0.3;                     // 30 % from the new reading and 70 % from the last value
+
+//-----SD card-----
+const char* LOG_FILE_PREFIX     = "/flight";              // files get named /flight001.csv, /flight002.csv and so on
+const int   MAX_LOG_FILES       = 999;                    // the most file numbers it will check
+const int   SD_FLUSH_EVERY_ROWS = 10;                     // actually saves to the card every 10 rows (every 1 s)
+
+//-----Voltage sensing-----
+const float BATTERY_DIVIDER     = 2.0;                   // (R2 + R3) / R3 = (100K + 100K) / 100K, the pin sees half the voltage
+const float REGULATOR_DIVIDER   = 2.0;                   // (R6 + R7) / R7 = (100K + 100K) / 100K, the pin sees half the voltage
+const float DIODE_DROP_V        = 0.3;                   // voltage lost across the D2 schottky, the battery gets measured after it
+const float LOW_BATTERY_V       = 3.5;                   // warns at start up if the battery is below this
+const int   ADC_AVERAGE_SAMPLES = 8;                     // takes 8 readings and averages them to cut down noise
+
+//-----Physics-----
+const float STANDARD_GRAVITY = 9.80665;                   // value of 1 g in m/s^2
+
+
+// Global Variables
+
+// allows the sensors to communicate with the chip
+Adafruit_MPU6050 mpu;
+Adafruit_BMP3XX  bmp;
+
+// the 5 flight phases, enum gives the numbers 0 to 4 names so they are easier to read
+enum FlightPhase { PAD, BOOST, COAST, DESCENT, LANDED };
+FlightPhase phase = PAD;   // always starts on the pad
+
+// one sample = one row in the CSV file
+// a struct groups all the values from one sample together
+struct DataRow {
+  unsigned long timeMs;                                   // time the sample was taken (millis)
+  float ax, ay, az;                                       // raw accel on x, y, z (m/s^2)
+  float gx, gy, gz;                                       // raw spin rate on x, y, z (deg/s)
+  float pressurePa;                                       // raw pressure (Pa)
+  float temperatureC;                                     // raw temp (deg C)
+  float batteryV;                                         // battery voltage (V)
+  float regulatorV;                                       // 5V regulator output voltage (V)
+  float altitudeRaw;                                      // altitude straight from the pressure, not smoothed so it is noisy (m)
+  float altitude;                                         // altitude above the pad after smoothing (m)
+  float velocity;                                         // vertical speed after smoothing, + is up and - is down (m/s)
+  float accelTotalG;                                      // total accel from all 3 axes (g)
+  float maxAltitude;                                      // highest point so far (m)
+  float maxVelocity;                                      // fastest speed going up so far (m/s)
+  float maxAccelG;                                        // biggest accel so far (g)
+  FlightPhase phase;                                      // what phase the rocket was in for this row
+};
+
+// ---- Calibration results ----
+float groundPressurePa = 101325.0;  // average pressure on the pad
+float restAccelG       = 1.0;       // accel reading when sitting still (should be about 1 g)
+
+// ---- Timing ----
+unsigned long lastSampleTime = 0;   // when the last sample was meant to happen (ms)
+unsigned long prevCalcTimeMs = 0;   // time of the last calculation, needed to work out dt
+
+// ---- Smoothing / velocity ----
+bool  firstCalculation = true;      // the first sample has no "previous" value to compare with which is why it dosent get smoothed out
+float smoothedAltitude = 0;
+float smoothedVelocity = 0;
+
+// ---- Event detection counters ----
+int           launchCounter       = 0;   // how many consecutive sensor readings satisfy launcg detection (after 2 its not needed)
+unsigned long launchCandidateMs   = 0;   // time of the first sample that looked like a launch
+int           burnoutCounter      = 0;
+int           apogeeCounter       = 0;
+bool          landingTimerRunning = false;
+unsigned long landingCandidateMs  = 0;   // time the rocket first looked still
+
+// ---- Flight event times ----
+unsigned long launchTimeMs    = 0;
+unsigned long landingTimeMs   = 0;
+
+// ---- Max values (only start counting after launch) ----
+float         maxAltitude       = 0;
+float         maxVelocity       = 0;
+float         maxAccelG         = 0;
+unsigned long maxAltitudeTimeMs = 0;   // time of the highest point (apogee)
+
+// ---- Pre-launch rolling buffer (circular buffer) ----
+DataRow preLaunchBuffer[PRELAUNCH_BUFFER_SAMPLES];
+int     bufferNextIndex = 0;   // which slot the next sample goes in
+int     bufferCount     = 0;   // how many slots have data in them (max 20)
+
+// ---- SD card ----
+File logFile;                  // the CSV file that is open
+bool logFileOpen = false;
+char logFileName[32];          // e.g. /flight003.csv
+char summaryFileName[40];      // e.g. /flight003_summary.txt
+int  rowsSinceFlush = 0;
+
+// ---- Function List----
+void startMPU6050();
+void startBMP388();
+void startSDCard();
+void chooseLogFileNames();
+void haltWithError (const char* message); 
+void calibrateSensors();
+void waitForNextTick();
+void readSensors(DataRow &row);
+float readVoltage(int pin, float divider);
+void calculateFlightValues(DataRow &row);
+float pressureToAltitude(float pressurePa);
+void updateMaxValues(DataRow &row);
+void addToPreLaunchBuffer(const DataRow &row);
+bool checkForLaunch(const DataRow &row);
+void updateFlightPhase(const DataRow &row);
+void checkForApogee(const DataRow &row);
+void checkForLanding(const DataRow &row);
+void startFlightLog();
+void writeCSVHeader();
+void writeRowToSD(const DataRow &row);
+void finishFlight();
+void printSummary(Print &out);
+void printStatus(const DataRow &row);
+const char* phaseName(FlightPhase p);
+
+// this runs every time the board powers on or is reset
+void setup() {
+ // put your setup code here, to run once:
+ // serial motor connection at 115200 bit per second (common speed)
+ Serial.begin(115200); 
+
+ // test if commputer is connected to laptop or independent
+ unsigned long serialWaitStart = millis ();
+ while (!Serial && (millis() - serialWaitStart <3000)) {
+  //this checks whether the ESP is connected to a laptop before continuing
+  //with the rest of the code. after 3 seconds it continues running without being connected.
+ }
+
+ Serial.println();
+ Serial.println("Rocket Data Logger Starting");
+
+ // starts I2C on our pins (SDA 22, SCL 21) at 400 kHz, without this it cannot find the sensors
+ Wire.begin(SDA_PIN, SCL_PIN);
+ Wire.setClock(400000);
+
+ // start sensors
+ startMPU6050();
+ startBMP388();
+
+ // lets the ADC pins read the full 0 to 3.3V range
+ analogSetAttenuation(ADC_11db);
+
+ // start the SD card
+ startSDCard();
+
+ // calibrates stationary postion 
+ calibrateSensors();
+
+ Serial.println ("Ready. Phase = On Pad. Waiting for launch");
+ lastSampleTime = millis();
+}
+
+// starting the Sensors and SD Card
+void startMPU6050() {
+  if (!mpu.begin(MPU6050_ADDRESS, &Wire)){
+    haltWithError ("MPU6050 not found! Check Wiring (SDA/SCL), power, and that its address is 0x68.");
+  }
+  mpu.setAccelerometerRange(MPU6050_RANGE_16_G); // sets the acceptable range of data + - 16g, so that the acceleration wont make out.
+  mpu.setGyroRange(MPU6050_RANGE_2000_DEG); // sets the acceptanle range +- 2000 degs, so if it spins fast it wont max out.
+  mpu.setFilterBandwidth(MPU6050_BAND_44_HZ); // built-in removes vibration as only allows frequency signals under 44
+  Serial.println("MPU6050 Ok");
+}
+
+// Start the BMP388 and set it for altitude measurement.
+void startBMP388() {
+  if (!bmp.begin_I2C(BMP388_ADDRESS, &Wire)) {
+    haltWithError("BMP388 not found! Check wiring (SDA/SCL), power, and that its address is 0x76.");
+  }
+  // oversampling means the chip takes a few readings and averages them, so there is less noise
+  bmp.setTemperatureOversampling(BMP3_OVERSAMPLING_2X);
+  bmp.setPressureOversampling(BMP3_OVERSAMPLING_8X);
+  // the IIR filter smooths the pressure inside the chip, a small setting only adds a small delay
+  bmp.setIIRFilterCoeff(BMP3_IIR_FILTER_COEFF_3); // the 3 means modereate filtering out of pressure
+  bmp.setOutputDataRate(BMP3_ODR_50_HZ); // the chip takes 50 measurements a second
+  Serial.println("BMP388 OK");
+}
+
+// starts the SD card using our SPI pins
+void startSDCard() {
+  SPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);   // tells it which pins the SD card is on
+  if (!SD.begin(SD_CS, SPI)) {
+    haltWithError("SD card failed! Check the card is inserted, formatted as FAT32, and wired correctly.");
+  }
+  chooseLogFileNames();
+  Serial.print("SD card OK. This flight will be saved as: ");
+  Serial.println(logFileName);
+}
+// find the first unused number: e.g. flight001.csv ..... file is only created at launch so power flickering in and out dosent create new file.
+void chooseLogFileNames() {
+  for (int i = 1; i <= MAX_LOG_FILES; i++) { // loop that checks filenames then increase by 1
+    // snprintf builds the file name, %s puts in the text and %03d puts in the number with 3 digits (7 becomes 007)
+    snprintf(logFileName, sizeof(logFileName), "%s%03d.csv", LOG_FILE_PREFIX, i);
+    if (!SD.exists(logFileName)) {
+      snprintf(summaryFileName, sizeof(summaryFileName), "%s%03d_summary.txt", LOG_FILE_PREFIX, i);
+      return;   // found a free number so it stops looking
+    }
+  }
+  haltWithError("All flight file numbers are used. Delete some files from the SD card.");
+}
+
+// if something important fails it prints why and then stops forever
+void haltWithError(const char* message) {
+  Serial.print("ERROR: ");
+  Serial.println(message);
+  Serial.println("Program stopped. Fix the problem and press RESET.");
+  while (true) {
+    delay(1000);
+  }
+}
+
+// ---- Calibration----
+void calibrateSensors() {
+  Serial.println("Calibrating... keep the rocket STILL and UPRIGHT on the pad.");
+  DataRow r;   // temporary row to store each reading
+
+  // 1) warm up, the first few readings after turning on can be wrong so they get thrown away
+  for (int i = 0; i < SENSOR_WARMUP_SAMPLES; i++) {
+    waitForNextTick();
+    readSensors(r);
+  }
+
+  // 2) adds up lots of readings so they can be averaged
+  //    double has more decimal places than float which helps when adding up lots of numbers
+  double pressureSum = 0, axSum = 0, aySum = 0, azSum = 0;
+
+  for (int i = 0; i < CALIBRATION_SAMPLES; i++) {
+    waitForNextTick();
+    readSensors(r);
+
+    pressureSum += r.pressurePa;
+    axSum += r.ax; // total accel along x axis
+    aySum += r.ay; // total accel along y axis
+    azSum += r.az; // total accel along z axis
+
+    if (i % 10 == 9) Serial.print(".");   // prints a dot every second so you know it is working
+  }
+  Serial.println();
+
+  // 3) average = total / number of readings
+  groundPressurePa = pressureSum / CALIBRATION_SAMPLES;
+  float restAx = axSum / CALIBRATION_SAMPLES;       // average accel on x axis
+  float restAy = aySum / CALIBRATION_SAMPLES;
+  float restAz = azSum / CALIBRATION_SAMPLES;
+  restAccelG = sqrt(restAx * restAx + restAy * restAy + restAz * restAz) / STANDARD_GRAVITY;   // a = F_net / mass
+
+  // 4) prints the results
+  Serial.print("Ground pressure: ");
+  Serial.print(groundPressurePa, 1);
+  Serial.println(" Pa  (this is now altitude 0 m)");
+
+  Serial.print("Resting acceleration: ");
+  Serial.print(restAccelG, 3);
+  Serial.println(" g  (should be close to 1 g)");
+
+  // 5) checking the battery and regulator before launch
+  Serial.print("Battery: ");
+  Serial.print(r.batteryV, 2);
+  Serial.print(" V   Regulator: ");
+  Serial.print(r.regulatorV, 2);
+  Serial.println(" V");
+  if (r.batteryV < LOW_BATTERY_V) {
+    Serial.println("WARNING: battery is low or switched off. Charge it before launching.");
+  }
+}
+
+// waits until 100 ms has passed since it was last called (uses millis)
+// only used for calibration in setup() because nothing else needs to run then
+// static means lastTick keeps its value between calls
+void waitForNextTick() {
+  static unsigned long lastTick = 0;
+  while (millis() - lastTick < SAMPLE_INTERVAL_MS) {
+    // just waits
+  }
+  lastTick = millis();
+}
+
+
+void loop() {
+  // put your main code here, to run repeatedly:
+ unsigned long now = millis();   // ms since the board turned on
+
+  // checks if 100 ms has passed yet, if not it leaves loop() straight away
+  // loop() runs again straight after so this gets checked thousands of times a second
+  if (now - lastSampleTime < SAMPLE_INTERVAL_MS) {
+    return;
+  }
+
+  // sets the next sample for exactly 100 ms after this one was meant to happen
+  // adding 100 instead of making it = now stops small delays from adding up
+  // so it stays at exactly 10 samples a second
+  lastSampleTime += SAMPLE_INTERVAL_MS;
+
+  // if something made it really late (like a slow SD card write) it does not try to catch up
+  // with a bunch of quick samples, it just restarts the timing from now
+  if (now - lastSampleTime >= SAMPLE_INTERVAL_MS) {
+    lastSampleTime = now;
+  }
+
+  // 1. take a sample
+  DataRow row;
+  row.timeMs = now;
+  readSensors(row);
+
+  // 2. work out altitude, velocity and accel from the raw readings
+  calculateFlightValues(row);
+
+  // 3. what happens next depends on the flight phase
+  if (phase == PAD) {
+    // on the pad the sample only goes in the rolling buffer, NOT the SD card
+    row.maxAltitude = 0;
+    row.maxVelocity = 0;
+    row.maxAccelG   = 0;
+    row.phase       = PAD;
+    addToPreLaunchBuffer(row);
+
+    if (checkForLaunch(row)) {
+      phase = BOOST;
+      Serial.println("*** LAUNCH DETECTED! Logging to SD card... ***");
+      startFlightLog();   // makes the file and saves the 2 s buffer to it (this sample is in there too)
+    }
+  }
+  else if (phase != LANDED) {
+    // in the air: update the max values, check if the phase has changed and save the row
+    updateMaxValues(row);
+    updateFlightPhase(row);
+    row.phase = phase;
+    writeRowToSD(row);
+
+    if (phase == LANDED) {
+      finishFlight();     // closes the file and writes the summary
+    }
+  }
+  // after landing it keeps reading and printing but does not save anything
+
+  // 4. print the status line to the serial monitor
+  printStatus(row);
+}
+
+
+// ---- reading the sensors----
+// puts the raw sensor readings into the row
+// the & means it changes the actual row, not a copy of it
+void readSensors(DataRow &row) {
+  // MPU6050 gives accel (m/s^2), rotation (rad/s) and the chip temp
+  sensors_event_t accel, gyro, temp;
+  mpu.getEvent(&accel, &gyro, &temp);
+  row.ax = accel.acceleration.x;
+  row.ay = accel.acceleration.y;
+  row.az = accel.acceleration.z;
+  row.gx = gyro.gyro.x * RAD_TO_DEG;   // changes rad/s to deg/s because degrees are easier to understand
+  row.gy = gyro.gyro.y * RAD_TO_DEG;
+  row.gz = gyro.gyro.z * RAD_TO_DEG;
+
+  // BMP388 gives pressure (Pa) and temp (deg C)
+  // if a reading fails the library just keeps the last good value (fall back value)
+  bmp.performReading();
+  row.pressurePa   = bmp.pressure;
+  row.temperatureC = bmp.temperature;
+
+  // battery and regulator voltages
+  float afterDiodeV = readVoltage(BATTERY_ADC_PIN, BATTERY_DIVIDER);   // battery voltage after the D2 diode
+  if (afterDiodeV > 0.5) {
+    row.batteryV = afterDiodeV + DIODE_DROP_V;   // adds back the voltage the diode drops
+  } else {
+    row.batteryV = 0;                            // battery is switched off or not plugged in
+  }
+  row.regulatorV = readVoltage(REGULATOR_ADC_PIN, REGULATOR_DIVIDER);
+}
+
+// reads an ADC pin and works out the real voltage before the divider
+// analogReadMilliVolts gives a calibrated reading in mV
+float readVoltage(int pin, float divider) {
+  unsigned long totalMv = 0;
+  for (int i = 0; i < ADC_AVERAGE_SAMPLES; i++) {
+    totalMv += analogReadMilliVolts(pin);
+  }
+  float pinV = (totalMv / (float)ADC_AVERAGE_SAMPLES) / 1000.0;   // average voltage at the pin (V)
+  return pinV * divider;                                          // voltage before the divider
+}
+
+
+// ---- Calculations of data ----
+void calculateFlightValues(DataRow &row) {
+  // 1. altitude above the pad from the pressure
+  row.altitudeRaw = pressureToAltitude(row.pressurePa);
+
+  // 2. total accel from all 3 axes using 3D pythagoras
+  float accelMagnitude = sqrt(row.ax * row.ax + row.ay * row.ay + row.az * row.az);  // in m/s^2
+  row.accelTotalG = accelMagnitude / STANDARD_GRAVITY;                                // changes it to g
+
+  // 3. smoothed altitude and vertical velocity
+  if (firstCalculation) {
+    // first sample has nothing to compare to yet
+    smoothedAltitude = row.altitudeRaw;
+    smoothedVelocity = 0;
+    firstCalculation = false;
+  } else {
+    // time since the last sample in seconds (around 0.1 s)
+    float dt = (row.timeMs - prevCalcTimeMs) / 1000.0;
+    if (dt <= 0) dt = SAMPLE_INTERVAL_MS / 1000.0;   // stops it from ever dividing by 0
+
+    // exponential smoothing: new = (a x new reading) + ((1 - a) x last smoothed value)
+    float newSmoothedAltitude = ALTITUDE_SMOOTHING * row.altitudeRaw
+                              + (1.0 - ALTITUDE_SMOOTHING) * smoothedAltitude;
+
+    // velocity = change in altitude / change in time
+    float rawVelocity = (newSmoothedAltitude - smoothedAltitude) / dt;
+
+    // smooths the velocity as well because dividing by a small dt makes the noise a lot bigger
+    smoothedVelocity = VELOCITY_SMOOTHING * rawVelocity
+                     + (1.0 - VELOCITY_SMOOTHING) * smoothedVelocity;
+
+    smoothedAltitude = newSmoothedAltitude;
+  }
+  prevCalcTimeMs = row.timeMs;
+
+  row.altitude = smoothedAltitude;
+  row.velocity = smoothedVelocity;
+}
+
+// barometric formula, turns pressure into height above where the pressure
+// was groundPressurePa (the launch site)
+//   altitude = 44330 x (1 - (P / P0) ^ 0.1903)
+float pressureToAltitude(float pressurePa) {
+  return 44330.0 * (1.0 - pow(pressurePa / groundPressurePa, 0.1903));
+}
+
+// keeps track of the biggest values so far and puts them in the row so they get logged
+void updateMaxValues(DataRow &row) {
+  if (row.altitude > maxAltitude) {
+    maxAltitude = row.altitude;
+    maxAltitudeTimeMs = row.timeMs;   // saves the time of the highest point
+  }
+  if (row.velocity > maxVelocity) maxVelocity = row.velocity;
+  if (row.accelTotalG > maxAccelG) maxAccelG = row.accelTotalG;
+
+  row.maxAltitude = maxAltitude;
+  row.maxVelocity = maxVelocity;
+  row.maxAccelG   = maxAccelG;
+}
+
+
+// Pre Launch buffer and Launch detection 
+
+// puts a sample in the circular buffer, once it is full it writes over the oldest one
+void addToPreLaunchBuffer(const DataRow &row) {
+  preLaunchBuffer[bufferNextIndex] = row;
+  bufferNextIndex = (bufferNextIndex + 1) % PRELAUNCH_BUFFER_SAMPLES;  // % makes it go from 20 back to 0
+  if (bufferCount < PRELAUNCH_BUFFER_SAMPLES) {
+    bufferCount++;
+  }
+}
+
+// gives back true once a launch is confirmed
+bool checkForLaunch(const DataRow &row) {
+  // how much more accel there is compared to sitting still
+  float extraG = row.accelTotalG - restAccelG;
+
+  // Test A: the motor is pushing hard
+  bool accelTest = extraG > LAUNCH_ACCEL_THRESHOLD_G;
+
+  // Test B: the barometer shows it is climbing (backup in case test A misses it)
+  bool baroTest = (row.velocity > LAUNCH_VELOCITY_THRESHOLD) &&
+                  (row.altitude > LAUNCH_ALTITUDE_THRESHOLD);
+
+  if (accelTest || baroTest) {
+    if (launchCounter == 0) {
+      launchCandidateMs = row.timeMs;   // saves when the launch-like samples started
+    }
+    launchCounter++;
+  } else {
+    launchCounter = 0;                  // streak is broken so it starts counting again
+  }
+
+  if (launchCounter >= LAUNCH_CONFIRM_SAMPLES) {
+    launchTimeMs = launchCandidateMs;   // launch time is the first sample that looked like a launch
+    maxAltitudeTimeMs = launchTimeMs;
+    return true;
+  }
+  return false;
+}
+
+
+// ---- Flight Phases ----
+void updateFlightPhase(const DataRow &row) {
+  float extraG = row.accelTotalG - restAccelG;
+
+  switch (phase) {
+    case BOOST:
+      // burnout: accel has dropped back down because the motor stopped pushing
+      if (extraG < BURNOUT_ACCEL_THRESHOLD_G) {
+        burnoutCounter++;
+      } else {
+        burnoutCounter = 0;
+      }
+      if (burnoutCounter >= BURNOUT_CONFIRM_SAMPLES) {
+        phase = COAST;
+        Serial.println("*** BURNOUT - now coasting ***");
+      }
+      checkForApogee(row);   // backup in case burnout never got detected
+      break;
+
+    case COAST:
+      checkForApogee(row);
+      break;
+
+    case DESCENT:
+      checkForLanding(row);
+      break;
+
+    default:
+      break;
+  }
+
+  // backup: if landing never gets detected it stops anyway so the file always gets closed
+  if (phase != LANDED && (row.timeMs - launchTimeMs) > MAX_FLIGHT_TIME_MS) {
+    phase = LANDED;
+    landingTimeMs = row.timeMs;
+    Serial.println("*** MAX FLIGHT TIME REACHED - stopping the log ***");
+  }
+}
+
+// apogee is the highest point, it has passed it when it is moving down
+// and is clearly below the highest altitude recorded
+void checkForApogee(const DataRow &row) {
+  bool movingDown = row.velocity < 0;
+  bool belowPeak  = row.altitude < (maxAltitude - APOGEE_DROP_M);
+
+  if (movingDown && belowPeak) {
+    apogeeCounter++;
+  } else {
+    apogeeCounter = 0;
+  }
+
+  if (apogeeCounter >= APOGEE_CONFIRM_SAMPLES) {
+    phase = DESCENT;
+    Serial.print("*** APOGEE PASSED - max altitude ");
+    Serial.print(maxAltitude, 1);
+    Serial.println(" m. Now descending ***");
+  }
+}
+
+// Landed = not moving up or down 
+// and stays like that for LANDING_CONFIRM_MS
+void checkForLanding(const DataRow &row) {
+  bool notMovingVertically = fabs(row.velocity) < LANDING_VELOCITY_THRESHOLD; // fabs is absolute float value
+  bool feelsLikeRest       = fabs(row.accelTotalG - restAccelG) < LANDING_ACCEL_TOLERANCE_G;
+
+  if (notMovingVertically && feelsLikeRest) {
+    if (!landingTimerRunning) {
+      landingTimerRunning = true;
+      landingCandidateMs = row.timeMs;   // first time it looked still
+    }
+    if (row.timeMs - landingCandidateMs >= LANDING_CONFIRM_MS) {
+      phase = LANDED;
+      landingTimeMs = landingCandidateMs;   // touchdown is when it first went still
+      Serial.println("*** LANDED ***");
+    }
+  } else {
+    landingTimerRunning = false;            // it moved again so the timer restarts
+  }
+}
+
+// Saving to SD reader
+
+// runs once at launch: makes the CSV file, writes the column names,
+// then writes the 2 seconds of pre-launch data from the buffer (oldest first)
+void startFlightLog() {
+  logFile = SD.open(logFileName, FILE_WRITE);
+  if (!logFile) {
+    Serial.println("ERROR: could not create the log file! This flight will NOT be saved.");
+    logFileOpen = false;
+    return;
+  }
+  logFileOpen = true;
+  writeCSVHeader();
+
+  // the oldest sample is bufferCount slots behind the next slot (it wraps around)
+  int oldestIndex = (bufferNextIndex - bufferCount + PRELAUNCH_BUFFER_SAMPLES) % PRELAUNCH_BUFFER_SAMPLES;
+
+  for (int i = 0; i < bufferCount; i++) {
+    int index = (oldestIndex + i) % PRELAUNCH_BUFFER_SAMPLES;
+    DataRow &bufferedRow = preLaunchBuffer[index];
+
+    // samples from the launch onwards count as flight, not pad
+    if (bufferedRow.timeMs >= launchTimeMs) {
+      bufferedRow.phase = BOOST;
+      updateMaxValues(bufferedRow);
+    }
+    writeRowToSD(bufferedRow);
+  }
+  logFile.flush();
+
+  Serial.print("Created ");
+  Serial.print(logFileName);
+  Serial.print(" and saved ");
+  Serial.print(bufferCount);
+  Serial.println(" pre-launch rows.");
+}
+
+// first line of the CSV is the column names
+void writeCSVHeader() {
+  logFile.println("time_s,flight_time_s,phase,"
+                  "accel_x_ms2,accel_y_ms2,accel_z_ms2,"
+                  "gyro_x_dps,gyro_y_dps,gyro_z_dps,"
+                  "pressure_pa,temperature_c,battery_v,regulator_v,"
+                  "altitude_raw_m,altitude_m,vertical_velocity_ms,accel_total_g,"
+                  "max_altitude_m,max_velocity_ms,max_accel_g");
+}
+
+// writes one row: raw sensor data + calculated values with commas in between
+void writeRowToSD(const DataRow &row) {
+  if (!logFileOpen) return;
+
+  // time since launch, negative means before launch (the buffered pad data)
+  float flightTimeS = (long)(row.timeMs - launchTimeMs) / 1000.0;
+
+  // builds the whole line first then writes it all at once (faster than lots of small writes)
+  // %.3f = number with 3 decimal places, %.2f = number with 2 decimal places, %s = text
+  char line[256];
+  snprintf(line, sizeof(line),
+            "%.3f,%.2f,%s,%.3f,%.3f,%.3f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.3f,%.2f,%.2f,%.3f",
+           row.timeMs / 1000.0, flightTimeS, phaseName(row.phase),
+           row.ax, row.ay, row.az,
+           row.gx, row.gy, row.gz,
+           row.pressurePa, row.temperatureC,
+           row.batteryV, row.regulatorV,
+           row.altitudeRaw, row.altitude, row.velocity, row.accelTotalG,
+           row.maxAltitude, row.maxVelocity, row.maxAccelG);
+  logFile.println(line);
+
+  // data sits in memory first, flush() is what actually writes it to the card
+  // doing it every second means if it crashes or loses power only about 1 s of data is lost
+  rowsSinceFlush++;
+  if (rowsSinceFlush >= SD_FLUSH_EVERY_ROWS) {
+    logFile.flush();
+    rowsSinceFlush = 0;
+  }
+}
+
+// runs once after landing: closes the data file and writes the summary
+void finishFlight() {
+  if (logFileOpen) {
+    logFile.flush();
+    logFile.close();
+    logFileOpen = false;
+  }
+
+  File summaryFile = SD.open(summaryFileName, FILE_WRITE);
+  if (summaryFile) {
+    printSummary(summaryFile);   // writes the summary into the file
+    summaryFile.close();
+  } else {
+    Serial.println("ERROR: could not create the summary file.");
+  }
+  printSummary(Serial);          // and prints the same summary to the serial monitor
+
+  Serial.println("All data saved. Press RESET to get ready for the next flight.");
+}
+
+// prints the flight summary to either the SD card file or the serial monitor
+// both count as a Print so the same code works for both
+void printSummary(Print &out) {
+  float timeToApogeeS = (long)(maxAltitudeTimeMs - launchTimeMs) / 1000.0;
+  float flightTimeS   = (long)(landingTimeMs - launchTimeMs) / 1000.0;
+
+  out.println("========== FLIGHT SUMMARY ==========");
+  out.print("Data file:          "); out.println(logFileName);
+  out.print("Max altitude:       "); out.print(maxAltitude, 1);   out.println(" m");
+  out.print("Max velocity:       "); out.print(maxVelocity, 1);   out.println(" m/s (upwards)");
+  out.print("Max acceleration:   "); out.print(maxAccelG, 2);     out.println(" g");
+  out.print("Time to apogee:     "); out.print(timeToApogeeS, 2); out.println(" s");
+  out.print("Total flight time:  "); out.print(flightTimeS, 2);   out.println(" s");
+  out.print("Ground pressure:    "); out.print(groundPressurePa, 1); out.println(" Pa");
+  out.println("====================================");
+}
+
+
+// ---- Serial Monitor output ----
+
+// prints one status line every sample, it looks like this:
+// [COAST  ] T+   3.4 s | Alt  120.5 m | Vel  +33.2 m/s | Acc 0.02 g | P  99880.2 Pa | Bat 3.95 V | Reg 5.01 V | Max  120.5 m  58.8 m/s  5.02 g
+void printStatus(const DataRow &row) {
+  float timeS;
+  const char* timeLabel;
+  if (phase == PAD) {
+    timeLabel = "up";                                    // on the pad it shows seconds since turning on
+    timeS = row.timeMs / 1000.0;
+  } else {
+    timeLabel = "T+";                                    // after launch it shows seconds since launch
+    timeS = (long)(row.timeMs - launchTimeMs) / 1000.0;
+  }
+
+  // %-7s pads the text to 7 characters, %+6.1f always shows a + or - sign
+  char line[220];
+  snprintf(line, sizeof(line),
+           "[%-7s] %s %6.1f s | Alt %7.1f m | Vel %+6.1f m/s | Acc %5.2f g | P %9.1f Pa | Bat %4.2f V | Reg %4.2f V | Max %6.1f m %5.1f m/s %5.2f g",
+           phaseName(phase), timeLabel, timeS,
+           row.altitude, row.velocity, row.accelTotalG, row.pressurePa,
+           row.batteryV, row.regulatorV,
+           maxAltitude, maxVelocity, maxAccelG);
+  Serial.println(line);
+}
+
+// turns the phase number into text for the CSV and serial monitor
+const char* phaseName(FlightPhase p) {
+  switch (p) {
+    case PAD:     return "PAD";
+    case BOOST:   return "BOOST";
+    case COAST:   return "COAST";
+    case DESCENT: return "DESCENT";
+    case LANDED:  return "LANDED";
+  }
+  return "UNKNOWN";
+}
